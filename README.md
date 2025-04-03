@@ -6,7 +6,7 @@ Discord Link: [`conditioning_tools`](https://discord.com/channels/10201235590639
 
 ## Nodes
 
-- `Flux Redux Downsampling` - Downsampling or weighting a flux redux conditioning -  this is derived from 
+- `Flux Redux Downsampling` - Downsampling and/or weighting a flux redux conditioning -  this is derived from https://github.com/kaibioinfo/ComfyUI_AdvancedRefluxControl
 
 
 ## Usage

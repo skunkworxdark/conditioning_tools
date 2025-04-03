@@ -18,6 +18,7 @@ from invokeai.invocation_api import (
 DOWNSAMPLING_FUNCTIONS = Literal["nearest", "bilinear", "bicubic", "area", "nearest-exact"]
 
 
+# This is derived from https://github.com/kaibioinfo/ComfyUI_AdvancedRefluxControl
 @invocation(
     "flux_redux_downsampling",
     title="FLUX Redux Downsampling",
@@ -46,7 +47,7 @@ class FluxReduxDownsamplingInvocation(BaseInvocation):
         ge=0,
         le=1,
         default=1.0,
-        description="Redux weight (0-1)",
+        description="Redux weight (0.0-1.0)",
     )
 
     def invoke(self, context: InvocationContext) -> FluxReduxOutput:
@@ -59,11 +60,14 @@ class FluxReduxDownsamplingInvocation(BaseInvocation):
             rc = rc.view(b, m, m, h)
 
             rc = torch.nn.functional.interpolate(
-                rc.transpose(1, -1), size=(m // self.downsampling_factor, m // self.downsampling_factor), mode=self.downsampling_function
+                rc.transpose(1, -1),
+                size=(m // self.downsampling_factor, m // self.downsampling_factor),
+                mode=self.downsampling_function,
             )
             rc = rc.transpose(1, -1).reshape(b, -1, h)
 
-        rc = rc * self.weight * self.weight
+        if self.weight != 1.0:
+            rc = rc * self.weight * self.weight
 
         tensor_name = context.tensors.save(rc)
         return FluxReduxOutput(
