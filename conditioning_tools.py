@@ -1,14 +1,21 @@
 # 2025 skunkworxdark (https://github.com/skunkworxdark)
 
-import math
-from typing import Literal
+from math import sqrt
+from typing import Literal, Union
 
 import torch
 from torch.linalg import norm
+from transformers import T5Tokenizer, T5TokenizerFast
 from typing_extensions import get_args
 
-from invokeai.app.invocations.fields import FluxConditioningField, FluxReduxConditioningField, TensorField
+from invokeai.app.invocations.fields import (
+    FluxConditioningField,
+    FluxReduxConditioningField,
+    TensorField,
+    UIComponent,
+)
 from invokeai.app.invocations.flux_redux import FluxReduxOutput
+from invokeai.app.invocations.model import ModelIdentifierField, T5EncoderField
 from invokeai.app.invocations.primitives import FluxConditioningOutput
 from invokeai.backend.stable_diffusion.diffusion.conditioning_data import ConditioningFieldData, FLUXConditioningInfo
 from invokeai.invocation_api import (
@@ -20,6 +27,20 @@ from invokeai.invocation_api import (
 )
 
 DOWNSAMPLING_FUNCTIONS = Literal["nearest", "bilinear", "bicubic", "area", "nearest-exact"]
+
+
+def _rescale_to_target_max_norm(tensor: torch.Tensor, target_norm: float) -> torch.Tensor:
+    """Rescales a tensor so that the vector with the largest L2 norm has a norm of `target_norm`."""
+    # Calculate the L2 norm for each vector along the last dimension
+    norms = torch.linalg.norm(tensor, dim=-1)
+    # Find the maximum norm
+    max_norm = torch.max(norms)
+    # Add a small epsilon to avoid division by zero
+    epsilon = torch.finfo(tensor.dtype).eps
+    # If max_norm is close to zero, no need to scale
+    if max_norm < epsilon:
+        return tensor
+    return tensor * (target_norm / (max_norm + epsilon))
 
 
 # This node is derived from https://github.com/kaibioinfo/ComfyUI_AdvancedRefluxControl
@@ -59,7 +80,7 @@ class FluxReduxDownsamplingInvocation(BaseInvocation):
 
         rc = cond_redux.clone()
         (b, t, h) = rc.shape
-        m = int(math.sqrt(t))
+        m = int(sqrt(t))
         if self.downsampling_factor > 1:
             rc = rc.view(b, m, m, h)
 
@@ -192,10 +213,6 @@ def _apply_conditioning_math(
     operation: CONDITIONING_MATH_OPERATIONS,
     high_prec_dtype: torch.dtype = torch.float64,
 ) -> torch.Tensor:
-    assert cond_a.shape == cond_b.shape, (
-        f"Tensor shapes must match for math operations a={cond_a.shape} b={cond_b.shape}"
-    )
-
     # Store original properties
     original_dtype = cond_a.dtype
     a = cond_a.to(dtype=high_prec_dtype)
@@ -203,6 +220,11 @@ def _apply_conditioning_math(
 
     epsilon = torch.finfo(high_prec_dtype).eps
     out = torch.zeros_like(a)
+
+    if operation != "APPEND":
+        assert cond_a.shape == cond_b.shape, (
+            f"Tensor shapes must match for this math operation: a={cond_a.shape}, b={cond_b.shape}"
+        )
 
     match operation:
         case "ADD":
@@ -214,15 +236,20 @@ def _apply_conditioning_math(
         case "DIV":
             out = a / (scale * b + epsilon)
         case "APPEND":
-            out = torch.cat((a, b), dim=-1)
+            assert a.shape[0] == b.shape[0] and a.shape[2] == b.shape[2], (
+                "Batch size and embedding dim must match for APPEND"
+            )
+            out = torch.cat((a, b), dim=1)
         case "SPV":
-            dot_product = torch.mul(a, b).sum()
-            norm_b_sq = torch.norm(b) ** 2
+            # Project a onto b, then add the scaled projection to a
+            dot_product = torch.sum(a * b, dim=-1, keepdim=True)
+            norm_b_sq = (torch.norm(b, dim=-1, keepdim=True) ** 2).clamp_min(epsilon)
             proj_a_on_b = (dot_product / (norm_b_sq + epsilon)) * b
             out = a + scale * proj_a_on_b
         case "NSPV":
-            dot_product = torch.mul(a, b).sum()
-            norm_b_sq = torch.norm(b) ** 2
+            # Project a onto b, then subtract the scaled projection from a
+            dot_product = torch.sum(a * b, dim=-1, keepdim=True)
+            norm_b_sq = (torch.norm(b, dim=-1, keepdim=True) ** 2).clamp_min(epsilon)
             proj_a_on_b = (dot_product / (norm_b_sq + epsilon)) * b
             out = a - scale * proj_a_on_b
         case "LERP":
@@ -318,7 +345,7 @@ def _slerp(
     title="FLUX Conditioning Math",
     tags=["conditioning", "math", "add", "subtract", "multiply", "divide", "flux"],
     category="conditioning",
-    version="1.0.0",
+    version="1.1.0",
 )
 class FluxConditioningMathOperationInvocation(BaseInvocation):
     """Performs a Math operation on two FLUX conditionings."""
@@ -342,6 +369,11 @@ class FluxConditioningMathOperationInvocation(BaseInvocation):
         le=3.0,
         description="Scaling factor",
     )
+    rescale_target_norm: float = InputField(
+        default=0.0,
+        ge=0.0,
+        description="If > 0, rescales the output embeddings to the target max norm. Set to 0 to disable.",
+    )
 
     def invoke(self, context: InvocationContext) -> FluxConditioningOutput:
         data_a = context.conditioning.load(self.cond_a.conditioning_name)
@@ -352,13 +384,30 @@ class FluxConditioningMathOperationInvocation(BaseInvocation):
         info_a = data_a.conditionings[0]
         info_b = data_b.conditionings[0]
         assert isinstance(info_a, FLUXConditioningInfo) and isinstance(info_b, FLUXConditioningInfo)
-        assert info_a.clip_embeds.shape == info_b.clip_embeds.shape, "CLIP embeds shapes must match"
-        assert info_a.t5_embeds.shape == info_b.t5_embeds.shape, "T5 embeds shapes must match"
 
         result_clip_embeds = _apply_conditioning_math(
             info_a.clip_embeds, info_b.clip_embeds, self.scale, self.operation
         )
         result_t5_embeds = _apply_conditioning_math(info_a.t5_embeds, info_b.t5_embeds, self.scale, self.operation)
+
+        if self.rescale_target_norm > 0.0:
+            # Log and rescale CLIP embeds
+            original_clip_max_norm = torch.max(torch.linalg.norm(result_clip_embeds, dim=-1))
+            context.logger.info(f"Original CLIP max norm after math: {original_clip_max_norm.item():.4f}")
+            result_clip_embeds = _rescale_to_target_max_norm(result_clip_embeds, self.rescale_target_norm)
+            new_clip_max_norm = torch.max(torch.linalg.norm(result_clip_embeds, dim=-1))
+            context.logger.info(
+                f"Rescaled CLIP max norm to: {new_clip_max_norm.item():.4f} (target: {self.rescale_target_norm:.4f})"
+            )
+
+            # Log and rescale T5 embeds
+            original_t5_max_norm = torch.max(torch.linalg.norm(result_t5_embeds, dim=-1))
+            context.logger.info(f"Original T5 max norm after math: {original_t5_max_norm.item():.4f}")
+            result_t5_embeds = _rescale_to_target_max_norm(result_t5_embeds, self.rescale_target_norm)
+            new_t5_max_norm = torch.max(torch.linalg.norm(result_t5_embeds, dim=-1))
+            context.logger.info(
+                f"Rescaled T5 max norm to: {new_t5_max_norm.item():.4f} (target: {self.rescale_target_norm:.4f})"
+            )
 
         new_info = FLUXConditioningInfo(clip_embeds=result_clip_embeds, t5_embeds=result_t5_embeds)
         new_cond_data = ConditioningFieldData(conditionings=[new_info])
@@ -376,7 +425,7 @@ class FluxConditioningMathOperationInvocation(BaseInvocation):
     title="FLUX Redux Conditioning Math",
     tags=["conditioning", "math", "add", "subtract", "multiply", "divide", "flux", "redux"],
     category="conditioning",
-    version="1.0.0",
+    version="1.1.0",
 )
 class FluxReduxConditioningMathOperationInvocation(BaseInvocation):
     """Performs a Math operation on two FLUX Redux conditionings."""
@@ -400,13 +449,27 @@ class FluxReduxConditioningMathOperationInvocation(BaseInvocation):
         le=3.0,
         description="Scaling factor",
     )
+    rescale_target_norm: float = InputField(
+        default=0.0,
+        ge=0.0,
+        description="If > 0, rescales the output embeddings to the target max norm. Set to 0 to disable.",
+    )
 
     def invoke(self, context: InvocationContext) -> FluxReduxOutput:
         tensor_a = context.tensors.load(self.cond_a.conditioning.tensor_name)
         tensor_b = context.tensors.load(self.cond_b.conditioning.tensor_name)
-        assert tensor_a.shape == tensor_b.shape, "Tensor shapes must match for math operations"
 
         result_tensor = _apply_conditioning_math(tensor_a, tensor_b, self.scale, self.operation)
+        if self.rescale_target_norm > 0.0:
+            original_max_norm = torch.max(torch.linalg.norm(result_tensor, dim=-1))
+            context.logger.info(f"Original Redux max norm after math: {original_max_norm.item():.4f}")
+
+            result_tensor = _rescale_to_target_max_norm(result_tensor, self.rescale_target_norm)
+
+            new_max_norm = torch.max(torch.linalg.norm(result_tensor, dim=-1))
+            context.logger.info(
+                f"Rescaled Redux max norm to: {new_max_norm.item():.4f} (target: {self.rescale_target_norm:.4f})"
+            )
 
         new_tensor_name = context.tensors.save(result_tensor)
 
@@ -417,46 +480,68 @@ class FluxReduxConditioningMathOperationInvocation(BaseInvocation):
         return FluxReduxOutput(redux_cond=output_field)
 
 
-def _normalize_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    """Normalizes a tensor to a unit vector (L2 norm of 1)."""
-    # Calculate the norm along the last dimension, keeping the dimension for broadcasting
-    tensor_norm = norm(tensor, dim=-1, keepdim=True)
-    # Add a small epsilon to avoid division by zero for zero-vectors
-    epsilon = torch.finfo(tensor.dtype).eps
-    # Divide by the norm
-    return tensor / (tensor_norm + epsilon)
-
-
 @invocation(
-    "flux_normalize_conditioning",
-    title="Normalize FLUX Conditioning",
-    tags=["conditioning", "math", "normalize", "flux"],
+    "flux_rescale_conditioning",
+    title="Rescale FLUX Conditioning",
+    tags=["conditioning", "math", "rescale", "flux"],
     category="conditioning",
     version="1.0.0",
 )
-class FluxNormalizeConditioningInvocation(BaseInvocation):
-    """Normalizes a FLUX conditioning field to a unit vector."""
+class FluxRescaleConditioningInvocation(BaseInvocation):
+    """Rescales a FLUX conditioning field to a target max norm."""
 
     conditioning: FluxConditioningField = InputField(
-        description="FLUX Conditioning to normalize",
+        description="FLUX Conditioning to rescale",
         input=Input.Connection,
     )
-    normalize_clip: bool = InputField(default=True, description="Normalize the CLIP embeddings")
-    normalize_t5: bool = InputField(default=True, description="Normalize the T5 embeddings")
+    clip_rescale: bool = InputField(
+        default=True,
+        description="Whether to rescale the CLIP embeddings.",
+    )
+    clip_target_norm: float = InputField(
+        default=30.0,
+        gt=0.0,
+        description="The target max norm for the CLIP embeddings.",
+    )
+    t5_rescale: bool = InputField(
+        default=True,
+        description="Whether to rescale the T5 embeddings.",
+    )
+    t5_target_norm: float = InputField(
+        default=10.0,
+        gt=0.0,
+        description="The target max norm for the T5 embeddings.",
+    )
 
     def invoke(self, context: InvocationContext) -> FluxConditioningOutput:
         cond_data = context.conditioning.load(self.conditioning.conditioning_name)
-        assert len(cond_data.conditionings) == 1, "Normalization currently supports only single conditioning info"
+        assert len(cond_data.conditionings) == 1, "Rescaling currently supports only single conditioning info"
         original_info = cond_data.conditionings[0]
         assert isinstance(original_info, FLUXConditioningInfo)
 
-        clip_embeds = original_info.clip_embeds
-        if self.normalize_clip:
-            clip_embeds = _normalize_tensor(clip_embeds)
+        if self.clip_rescale:
+            # Log and rescale CLIP embeds
+            original_clip_max_norm = torch.max(torch.linalg.norm(original_info.clip_embeds, dim=-1))
+            context.logger.info(f"Original CLIP max norm: {original_clip_max_norm.item():.4f}")
+            clip_embeds = _rescale_to_target_max_norm(original_info.clip_embeds, self.clip_target_norm)
+            new_clip_max_norm = torch.max(torch.linalg.norm(clip_embeds, dim=-1))
+            context.logger.info(
+                f"Rescaled CLIP max norm to: {new_clip_max_norm.item():.4f} (target: {self.clip_target_norm:.4f})"
+            )
+        else:
+            clip_embeds = original_info.clip_embeds
 
-        t5_embeds = original_info.t5_embeds
-        if self.normalize_t5:
-            t5_embeds = _normalize_tensor(t5_embeds)
+        if self.t5_rescale:
+            # Log and rescale T5 embeds
+            original_t5_max_norm = torch.max(torch.linalg.norm(original_info.t5_embeds, dim=-1))
+            context.logger.info(f"Original T5 max norm: {original_t5_max_norm.item():.4f}")
+            t5_embeds = _rescale_to_target_max_norm(original_info.t5_embeds, self.t5_target_norm)
+            new_t5_max_norm = torch.max(torch.linalg.norm(t5_embeds, dim=-1))
+            context.logger.info(
+                f"Rescaled T5 max norm to: {new_t5_max_norm.item():.4f} (target: {self.t5_target_norm:.4f})"
+            )
+        else:
+            t5_embeds = original_info.t5_embeds
 
         new_info = FLUXConditioningInfo(clip_embeds=clip_embeds, t5_embeds=t5_embeds)
         new_cond_data = ConditioningFieldData(conditionings=[new_info])
@@ -471,28 +556,188 @@ class FluxNormalizeConditioningInvocation(BaseInvocation):
 
 
 @invocation(
-    "flux_redux_normalize_conditioning",
-    title="Normalize FLUX Redux Conditioning",
-    tags=["conditioning", "math", "normalize", "flux", "redux"],
+    "flux_redux_rescale_conditioning",
+    title="Rescale FLUX Redux Conditioning",
+    tags=["conditioning", "math", "rescale", "flux", "redux"],
     category="conditioning",
     version="1.0.0",
 )
-class FluxReduxNormalizeConditioningInvocation(BaseInvocation):
-    """Normalizes a FLUX Redux conditioning field to a unit vector."""
+class FluxReduxRescaleConditioningInvocation(BaseInvocation):
+    """Rescales a FLUX Redux conditioning field to a target max norm."""
 
     redux_conditioning: FluxReduxConditioningField = InputField(
-        description="FLUX Redux Conditioning to normalize",
+        description="FLUX Redux Conditioning to rescale",
         input=Input.Connection,
+    )
+    target_norm: float = InputField(
+        default=1.0,
+        gt=0.0,
+        description="The target max norm for the conditioning.",
     )
 
     def invoke(self, context: InvocationContext) -> FluxReduxOutput:
         cond_tensor = context.tensors.load(self.redux_conditioning.conditioning.tensor_name)
 
-        normalized_tensor = _normalize_tensor(cond_tensor)
-        new_tensor_name = context.tensors.save(normalized_tensor)
+        original_max_norm = torch.max(torch.linalg.norm(cond_tensor, dim=-1))
+        context.logger.info(f"Original Redux max norm: {original_max_norm.item():.4f}")
+
+        rescaled_tensor = _rescale_to_target_max_norm(cond_tensor, self.target_norm)
+
+        new_max_norm = torch.max(torch.linalg.norm(rescaled_tensor, dim=-1))
+        context.logger.info(f"Rescaled Redux max norm to: {new_max_norm.item():.4f} (target: {self.target_norm:.4f})")
+
+        new_tensor_name = context.tensors.save(rescaled_tensor)
 
         return FluxReduxOutput(
             redux_cond=FluxReduxConditioningField(
                 conditioning=TensorField(tensor_name=new_tensor_name), mask=self.redux_conditioning.mask
             )
         )
+
+
+@invocation(
+    "flux_scale_prompt_section",
+    title="Scale FLUX Prompt Section(s)",
+    tags=["conditioning", "prompt", "scale", "flux"],
+    category="conditioning",
+    version="1.0.0",
+)
+class FluxScalePromptSectionInvocation(BaseInvocation):
+    """Scales one or more sections of a FLUX prompt conditioning."""
+
+    conditioning: FluxConditioningField = InputField(
+        description="FLUX Conditioning to modify",
+        input=Input.Connection,
+    )
+    t5_encoder: T5EncoderField = InputField(
+        title="T5Encoder",
+        description="T5 Encoder model and tokenizer used for the original conditioning.",
+        input=Input.Connection,
+    )
+    prompt: str = InputField(
+        description="The full prompt text used for the original conditioning.",
+        ui_component=UIComponent.Textarea,
+    )
+    prompt_section: Union[str, list[str]] = InputField(
+        description="The section or sections of the prompt to scale.",
+    )
+    scale: Union[float, list[float]] = InputField(
+        default=1.0, description="The scaling factor or factors for the prompt section(s)."
+    )
+    rescale_output: bool = InputField(
+        default=False,
+        description="Rescales the output T5 embeddings to have the same max vector norm as the original conditioning.",
+    )
+
+    def invoke(self, context: InvocationContext) -> FluxConditioningOutput:
+        cond_data = context.conditioning.load(self.conditioning.conditioning_name)
+        assert len(cond_data.conditionings) == 1
+        original_info = cond_data.conditionings[0]
+        assert isinstance(original_info, FLUXConditioningInfo)
+
+        sections: list[str] = self.prompt_section if isinstance(self.prompt_section, list) else [self.prompt_section]
+        scales: list[float] = self.scale if isinstance(self.scale, list) else [self.scale]
+
+        if len(sections) > 1 and len(scales) == 1:
+            scales = scales * len(sections)
+
+        if len(sections) != len(scales):
+            raise ValueError("The number of prompt sections must match the number of scales.")
+
+        new_t5_embeds = self._process_embeds(
+            context,
+            original_info.t5_embeds,
+            self.t5_encoder.tokenizer,
+            self.prompt,
+            sections,
+            scales,
+        )
+
+        if self.rescale_output:
+            original_norms = torch.linalg.norm(original_info.t5_embeds, dim=-1)
+            original_max_norm = torch.max(original_norms)
+
+            new_norms = torch.linalg.norm(new_t5_embeds, dim=-1)
+            new_max_norm = torch.max(new_norms)
+
+            context.logger.info(f"Original max norm: {original_max_norm.item():.4f}")
+            context.logger.info(f"Max norm after scaling section(s): {new_max_norm.item():.4f}")
+
+            # Add a small epsilon to avoid division by zero
+            epsilon = torch.finfo(new_t5_embeds.dtype).eps
+            if new_max_norm > epsilon:
+                rescale_factor = original_max_norm / new_max_norm
+                new_t5_embeds = new_t5_embeds * rescale_factor
+                context.logger.info(
+                    f"Rescaling by a factor of {rescale_factor.item():.4f} to restore original max norm."
+                )
+
+                new_norms = torch.linalg.norm(new_t5_embeds, dim=-1)
+                new_max_norm = torch.max(new_norms)
+
+                context.logger.info(f"Max norm after Rescaling: {new_max_norm.item():.4f}")
+
+        new_info = FLUXConditioningInfo(clip_embeds=original_info.clip_embeds.clone(), t5_embeds=new_t5_embeds)
+        new_cond_data = ConditioningFieldData(conditionings=[new_info])
+        new_cond_name = context.conditioning.save(new_cond_data)
+
+        return FluxConditioningOutput(
+            conditioning=FluxConditioningField(
+                conditioning_name=new_cond_name,
+                mask=self.conditioning.mask,
+            )
+        )
+
+    def _find_all_subsequence_indices(self, sequence, subsequence):
+        """Finds all occurrences of a subsequence and yields their start and end indices."""
+        len_sub = len(subsequence)
+        if len_sub == 0:
+            return
+        for i in range(len(sequence) - len_sub + 1):
+            if sequence[i : i + len_sub] == subsequence:
+                yield i, i + len_sub
+
+    def _process_embeds(
+        self,
+        context: InvocationContext,
+        embeds: torch.Tensor,
+        tokenizer_loader: ModelIdentifierField,
+        prompt: str,
+        sections: list[str],
+        scales: list[float],
+    ) -> torch.Tensor:
+        # Pooled embeddings (e.g. from CLIP) are 2D. Sequence embeddings (e.g. from T5) are 3D.
+        # We can only scale a section of a sequence embedding.
+        if embeds.dim() < 3:
+            context.logger.warning(f"Cannot apply prompt section scaling to a {embeds.dim()}D tensor. Skipping.")
+            return embeds.clone()
+
+        with context.models.load(tokenizer_loader) as tokenizer:
+            assert isinstance(tokenizer, (T5Tokenizer, T5TokenizerFast))
+            # We encode without special tokens to find the subsequence of token IDs.
+            prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
+
+            # Create a multiplier tensor (mask) to scale the embeddings.
+            # Initialize with ones, so non-scaled parts are multiplied by 1.
+            multipliers = torch.ones(embeds.shape[1], device=embeds.device, dtype=embeds.dtype)
+
+            for i, section in enumerate(sections):
+                section_tokens = tokenizer.encode(section, add_special_tokens=False)
+                scale = scales[i]
+
+                if not section_tokens:
+                    context.logger.warning(f"Prompt section at index {i} is empty, not scaling.")
+                    continue
+
+                indices = list(self._find_all_subsequence_indices(prompt_tokens, section_tokens))
+
+                if not indices:
+                    context.logger.warning(f"Prompt section '{section}' not found in prompt '{prompt}'.")
+                    continue
+
+                for start_idx, end_idx in indices:
+                    multipliers[start_idx:end_idx] *= scale
+
+            # Reshape multipliers to (1, sequence_length, 1) to broadcast correctly with embeds (1, sequence_length, embedding_dim)
+            # and apply the scaling in a single vectorized operation.
+            return embeds * multipliers.view(1, -1, 1)

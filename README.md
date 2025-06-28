@@ -11,8 +11,9 @@ Discord Link: [`conditioning_tools`](https://discord.com/channels/10201235590639
 -   `Scale FLUX Redux Conditioning` - Scales a FLUX Redux conditioning field by a factor.
 -   `FLUX Conditioning Math` - Performs a Math operation on two FLUX conditionings.
 -   `FLUX Redux Conditioning Math` - Performs a Math operation on two FLUX Redux conditionings.
--   `Normalize FLUX Conditioning` - Normalizes a FLUX conditioning field to a unit vector.
--   `Normalize FLUX Redux Conditioning` - Normalizes a FLUX Redux conditioning field to a unit vector.
+-   `Rescale FLUX Conditioning` - Rescales a FLUX conditioning field to a target max norm.
+-   `Rescale FLUX Redux Conditioning` - Rescales a FLUX Redux conditioning field to a target max norm.
+-   `Scale FLUX Prompt Section(s)` - Scales one or more sections of a FLUX prompt conditioning.
 
 ## Usage
 
