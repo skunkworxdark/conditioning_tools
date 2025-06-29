@@ -1,7 +1,7 @@
 # 2025 skunkworxdark (https://github.com/skunkworxdark)
 
 from math import sqrt
-from typing import Literal, Union
+from typing import Literal, Optional, Union
 
 import torch
 from torch.linalg import norm
@@ -600,7 +600,7 @@ class FluxReduxRescaleConditioningInvocation(BaseInvocation):
     title="Scale FLUX Prompt Section(s)",
     tags=["conditioning", "prompt", "scale", "flux"],
     category="conditioning",
-    version="1.0.0",
+    version="1.1.0",
 )
 class FluxScalePromptSectionInvocation(BaseInvocation):
     """Scales one or more sections of a FLUX prompt conditioning."""
@@ -624,6 +624,11 @@ class FluxScalePromptSectionInvocation(BaseInvocation):
     scale: Union[float, list[float]] = InputField(
         default=1.0, description="The scaling factor or factors for the prompt section(s)."
     )
+    positions: Optional[Union[int, list[int]]] = InputField(
+        default=None,
+        description="The start token position(s) of the section(s) to scale. If provided, this is used to locate the section(s) instead of searching.",
+        input=Input.Connection,
+    )
     rescale_output: bool = InputField(
         default=False,
         description="Rescales the output T5 embeddings to have the same max vector norm as the original conditioning.",
@@ -638,11 +643,19 @@ class FluxScalePromptSectionInvocation(BaseInvocation):
         sections: list[str] = self.prompt_section if isinstance(self.prompt_section, list) else [self.prompt_section]
         scales: list[float] = self.scale if isinstance(self.scale, list) else [self.scale]
 
-        if len(sections) > 1 and len(scales) == 1:
-            scales = scales * len(sections)
+        positions_list: Optional[list[int]] = None
+        if self.positions is not None:
+            positions_list = [self.positions] if isinstance(self.positions, int) else self.positions
+            if len(positions_list) != len(sections):
+                raise ValueError("The number of prompt sections must match the number of positions.")
 
-        if len(sections) != len(scales):
-            raise ValueError("The number of prompt sections must match the number of scales.")
+        num_items_to_scale = len(sections)
+
+        if len(scales) == 1 and num_items_to_scale > 1:
+            scales = scales * num_items_to_scale
+
+        if len(scales) != num_items_to_scale:
+            raise ValueError("The number of scales must match the number of sections to be scaled.")
 
         new_t5_embeds = self._process_embeds(
             context,
@@ -651,6 +664,7 @@ class FluxScalePromptSectionInvocation(BaseInvocation):
             self.prompt,
             sections,
             scales,
+            positions_list,
         )
 
         if self.rescale_output:
@@ -705,6 +719,7 @@ class FluxScalePromptSectionInvocation(BaseInvocation):
         prompt: str,
         sections: list[str],
         scales: list[float],
+        positions: Optional[list[int]] = None,
     ) -> torch.Tensor:
         # Pooled embeddings (e.g. from CLIP) are 2D. Sequence embeddings (e.g. from T5) are 3D.
         # We can only scale a section of a sequence embedding.
@@ -712,32 +727,48 @@ class FluxScalePromptSectionInvocation(BaseInvocation):
             context.logger.warning(f"Cannot apply prompt section scaling to a {embeds.dim()}D tensor. Skipping.")
             return embeds.clone()
 
+        multipliers = torch.ones(embeds.shape[1], device=embeds.device, dtype=embeds.dtype)
+
         with context.models.load(tokenizer_loader) as tokenizer:
             assert isinstance(tokenizer, (T5Tokenizer, T5TokenizerFast))
-            # We encode without special tokens to find the subsequence of token IDs.
-            prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
 
-            # Create a multiplier tensor (mask) to scale the embeddings.
-            # Initialize with ones, so non-scaled parts are multiplied by 1.
-            multipliers = torch.ones(embeds.shape[1], device=embeds.device, dtype=embeds.dtype)
+            if positions is not None:
+                # If positions are provided, use them to locate the sections to scale.
+                for i, start_idx in enumerate(positions):
+                    section_tokens = tokenizer.encode(sections[i], add_special_tokens=False)
+                    if not section_tokens:
+                        context.logger.warning(f"Prompt section at index {i} is empty, not scaling.")
+                        continue
 
-            for i, section in enumerate(sections):
-                section_tokens = tokenizer.encode(section, add_special_tokens=False)
-                scale = scales[i]
+                    end_idx = start_idx + len(section_tokens)
+                    if end_idx > multipliers.shape[0]:
+                        context.logger.warning(
+                            f"Section '{sections[i]}' at position {start_idx} extends beyond conditioning length of {multipliers.shape[0]}. Truncating."
+                        )
+                        end_idx = multipliers.shape[0]
 
-                if not section_tokens:
-                    context.logger.warning(f"Prompt section at index {i} is empty, not scaling.")
-                    continue
+                    multipliers[start_idx:end_idx] *= scales[i]
+            else:
+                # If no positions, find sections in the prompt string.
+                prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
 
-                indices = list(self._find_all_subsequence_indices(prompt_tokens, section_tokens))
+                for i, section in enumerate(sections):
+                    section_tokens = tokenizer.encode(section, add_special_tokens=False)
+                    scale = scales[i]
 
-                if not indices:
-                    context.logger.warning(f"Prompt section '{section}' not found in prompt '{prompt}'.")
-                    continue
+                    if not section_tokens:
+                        context.logger.warning(f"Prompt section at index {i} is empty, not scaling.")
+                        continue
 
-                for start_idx, end_idx in indices:
-                    multipliers[start_idx:end_idx] *= scale
+                    indices = list(self._find_all_subsequence_indices(prompt_tokens, section_tokens))
 
-            # Reshape multipliers to (1, sequence_length, 1) to broadcast correctly with embeds (1, sequence_length, embedding_dim)
-            # and apply the scaling in a single vectorized operation.
-            return embeds * multipliers.view(1, -1, 1)
+                    if not indices:
+                        context.logger.warning(f"Prompt section '{section}' not found in prompt '{prompt}'.")
+                        continue
+
+                    for start_idx, end_idx in indices:
+                        multipliers[start_idx:end_idx] *= scale
+
+        # Reshape multipliers to (1, sequence_length, 1) to broadcast correctly with embeds (1, sequence_length, embedding_dim)
+        # and apply the scaling in a single vectorized operation.
+        return embeds * multipliers.view(1, -1, 1)
