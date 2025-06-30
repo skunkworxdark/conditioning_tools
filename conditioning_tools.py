@@ -600,7 +600,7 @@ class FluxReduxRescaleConditioningInvocation(BaseInvocation):
     title="Scale FLUX Prompt Section(s)",
     tags=["conditioning", "prompt", "scale", "flux"],
     category="conditioning",
-    version="1.1.0",
+    version="1.2.0",
 )
 class FluxScalePromptSectionInvocation(BaseInvocation):
     """Scales one or more sections of a FLUX prompt conditioning."""
@@ -626,7 +626,7 @@ class FluxScalePromptSectionInvocation(BaseInvocation):
     )
     positions: Optional[Union[int, list[int]]] = InputField(
         default=None,
-        description="The start token position(s) of the section(s) to scale. If provided, this is used to locate the section(s) instead of searching.",
+        description="The start character position(s) of the section(s) to scale. If provided, this is used to locate the section(s) instead of searching.",
         input=Input.Connection,
     )
     rescale_output: bool = InputField(
@@ -734,20 +734,47 @@ class FluxScalePromptSectionInvocation(BaseInvocation):
 
             if positions is not None:
                 # If positions are provided, use them to locate the sections to scale.
-                for i, start_idx in enumerate(positions):
-                    section_tokens = tokenizer.encode(sections[i], add_special_tokens=False)
+                # The positions are character indices in the prompt. We convert them to token indices by tokenizing the
+                # text that comes before the given character position.
+
+                # Sanity check that the full tokenized prompt doesn't exceed the embedding length.
+                prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
+                if len(prompt_tokens) > embeds.shape[1]:
+                    context.logger.warning(
+                        f"The tokenized prompt length ({len(prompt_tokens)}) exceeds the conditioning tensor "
+                        f"length ({embeds.shape[1]}). The calculated token indices may be incorrect. This can happen "
+                        "if the prompt was truncated during the original encoding."
+                    )
+
+                for i, start_char in enumerate(positions):
+                    section = sections[i]
+
+                    # Sanity check that the section text at the given position matches.
+                    if not prompt.startswith(section, start_char):
+                        context.logger.warning(
+                            f"The prompt section '{section}' was not found at character position {start_char}. Skipping."
+                        )
+                        continue
+
+                    # Get the text before the section we want to scale.
+                    prefix = prompt[:start_char]
+                    # Tokenize the prefix to find the starting token index of our section.
+                    prefix_tokens = tokenizer.encode(prefix, add_special_tokens=False)
+                    start_token_idx = len(prefix_tokens)
+
+                    section_tokens = tokenizer.encode(section, add_special_tokens=False)
                     if not section_tokens:
                         context.logger.warning(f"Prompt section at index {i} is empty, not scaling.")
                         continue
 
-                    end_idx = start_idx + len(section_tokens)
-                    if end_idx > multipliers.shape[0]:
+                    end_token_idx = start_token_idx + len(section_tokens)
+                    if end_token_idx > multipliers.shape[0]:
                         context.logger.warning(
-                            f"Section '{sections[i]}' at position {start_idx} extends beyond conditioning length of {multipliers.shape[0]}. Truncating."
+                            f"Section '{section}' at position {start_char} extends beyond conditioning length of {multipliers.shape[0]}. Truncating."
                         )
-                        end_idx = multipliers.shape[0]
+                        end_token_idx = multipliers.shape[0]
 
-                    multipliers[start_idx:end_idx] *= scales[i]
+                    multipliers[start_token_idx:end_token_idx] *= scales[i]
             else:
                 # If no positions, find sections in the prompt string.
                 prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
