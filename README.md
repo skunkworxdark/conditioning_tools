@@ -1,4 +1,4 @@
-# `conditioning_tools` for InvokeAI (v4.0+)
+# `conditioning_tools` for InvokeAI (v6.0.0rc2+)
 
 A collection of experimental custom nodes for manipulating conditioning tensors
 
@@ -14,6 +14,7 @@ Discord Link: [`conditioning_tools`](https://discord.com/channels/10201235590639
 -   `Rescale FLUX Conditioning` - Rescales a FLUX conditioning field to a target max norm.
 -   `Rescale FLUX Redux Conditioning` - Rescales a FLUX Redux conditioning field to a target max norm.
 -   `Scale FLUX Prompt Section(s)` - Scales one or more sections of a FLUX prompt conditioning.
+-   `FLUX Weighted Prompt` - A drop in replacement for `Flux Prompt node with compel like weighting built in
 
 ## Usage
 
